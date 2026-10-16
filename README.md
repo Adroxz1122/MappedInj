@@ -1,6 +1,6 @@
 # Mapping Injection + Thread Hijacking
 
-x64 process injection PoC combining shared-section memory mapping with thread context hijacking to execute shellcode in a remote process — resolving all Nt* functions via PEB walking and hash-based export parsing, with no calls to `VirtualAllocEx`, `WriteProcessMemory`, `CreateRemoteThread`, `GetProcAddress`, or `GetModuleHandle`.
+x64 process injection PoC combining shared-section memory mapping with thread context hijacking to execute shellcode in a remote process , resolving all Nt* functions via PEB walking and hash-based export parsing, with no calls to `VirtualAllocEx`, `WriteProcessMemory`, `CreateRemoteThread`, `GetProcAddress`, or `GetModuleHandle`.
 
 Tested on Windows 10/11 x64. Uses calc.exe shellcode as a benign payload.
 
@@ -11,7 +11,7 @@ Tested on Windows 10/11 x64. Uses calc.exe shellcode as a benign payload.
 | Classic Injection IoC | Replacement |
 |---|---|
 | `VirtualAllocEx` | `NtCreateSection` + `NtMapViewOfSection` |
-| `WriteProcessMemory` | Shared memory — local view write propagates to remote |
+| `WriteProcessMemory` | Shared memory , local view write propagates to remote |
 | `CreateRemoteThread` | Thread context hijack (`SuspendThread` → `SetThreadContext` → `ResumeThread`) |
 | `GetModuleHandle` | PEB walk via `__readgsqword(0x60)` |
 | `GetProcAddress` | Manual PE export directory parsing with DJB2 hash matching |
@@ -22,7 +22,7 @@ No new threads are created. No memory is written across process boundaries. No W
 
 ## How It Works
 
-### 1. PEB Walking — Module Resolution Without `GetModuleHandle`
+### 1. PEB Walking , Module Resolution Without `GetModuleHandle`
 
 ```
 GS:[0x60]  →  PEB
@@ -45,7 +45,7 @@ No call to `GetModuleHandleA/W` or `LoadLibrary`.
 
 ---
 
-### 2. Export Directory Parsing — Function Resolution Without `GetProcAddress`
+### 2. Export Directory Parsing , Function Resolution Without `GetProcAddress`
 
 `GetProcAddReplacement` parses the PE export directory of the target module manually:
 
@@ -66,7 +66,7 @@ No call to `GetProcAddress`. No plaintext API name strings in the binary.
 
 ---
 
-### 3. Section-Based Injection — No `VirtualAllocEx` or `WriteProcessMemory`
+### 3. Section-Based Injection , No `VirtualAllocEx` or `WriteProcessMemory`
 
 ```
 NtCreateSection(PAGE_EXECUTE_READWRITE, SEC_COMMIT)
@@ -82,7 +82,7 @@ Both views point to the same physical pages. Writing shellcode to the local `PAG
 
 ---
 
-### 4. Thread Hijacking — No `CreateRemoteThread`
+### 4. Thread Hijacking , No `CreateRemoteThread`
 
 An existing thread in the target process is borrowed rather than a new one created:
 
@@ -134,7 +134,7 @@ main()
 ## Known Limitations
 
 **RIP not preserved**
-The original thread RIP is overwritten and not restored. When the shellcode executes a `RET`, control returns to whatever is on the thread's stack at the time of hijacking — likely causing the target process to crash after payload execution. A complete implementation would prepend a stub that saves the original RIP and restores it post-shellcode, or use an APC queue for safer execution.
+The original thread RIP is overwritten and not restored. When the shellcode executes a `RET`, control returns to whatever is on the thread's stack at the time of hijacking , likely causing the target process to crash after payload execution. A complete implementation would prepend a stub that saves the original RIP and restores it post-shellcode, or use an APC queue for safer execution.
 
 **Section created with PAGE_EXECUTE_READWRITE**
 `NtCreateSection` is called with `PAGE_EXECUTE_READWRITE`. While the individual views use minimal permissions (local RW, remote RX), the section's own protection flags are a detectable IoC. Creating the section as `PAGE_EXECUTE_READ` and mapping it locally with a separate writable view avoids this.
@@ -173,14 +173,14 @@ The purpose of this project is to understand the tradeoffs in injection techniqu
 
 ## Related Projects
 
-- [GhostlyIAT](https://github.com/Adroxz1122/GhostlyIAT) — the PEB walk and export directory parsing used here is an extension of techniques developed there
-- [Thread-Hijacking](https://github.com/Adroxz1122/Thread-Hijacking) — standalone thread hijacking implementation
+- [GhostlyIAT](https://github.com/Adroxz1122/GhostlyIAT) , the PEB walk and export directory parsing used here is an extension of techniques developed there
+- [Thread-Hijacking](https://github.com/Adroxz1122/Thread-Hijacking) , standalone thread hijacking implementation
 
 ---
 
 ## References
 
-- Windows Internals 7th Ed. — Part 1, Chapter 5 (Memory Management), Section Objects
-- ReactOS source — `NtCreateSection`, `NtMapViewOfSection` signatures  
-- MalDev Academy — Mapping Injection and Thread Hijacking modules
-- `winternl.h`, `TlHelp32.h` — undocumented structure definitions
+- Windows Internals 7th Ed. , Part 1, Chapter 5 (Memory Management), Section Objects
+- ReactOS source , `NtCreateSection`, `NtMapViewOfSection` signatures  
+- MalDev Academy , Mapping Injection and Thread Hijacking modules
+- `winternl.h`, `TlHelp32.h` , undocumented structure definitions
