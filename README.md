@@ -1,186 +1,84 @@
-# Dynamic API Resolution + Mapping Injection + Thread Hijacking
+# Section-Mapping Process Injection (Windows x64)
 
-x64 process injection PoC combining shared-section memory mapping with thread context hijacking to execute shellcode in a remote process , resolving all Nt* functions via PEB walking and hash-based export parsing, with no calls to `VirtualAllocEx`, `WriteProcessMemory`, `CreateRemoteThread`, `GetProcAddress`, or `GetModuleHandle`.
+A Windows x64 C proof of concept exploring **section-based process injection** and **thread-context redirection**. The program decrypts an embedded byte array, creates a Windows section object, maps that section into the current process and a target process, and redirects a target thread's instruction pointer to the remote mapping.
 
-Tested on Windows 10/11 x64. Uses calc.exe shellcode as a benign payload.
+> **Status:** Experimental research code. The uploaded source contains a placeholder for the encrypted payload, so it is not a ready-to-run demonstration as provided.
 
----
+## Overview
 
-## IoCs Eliminated
+The implementation combines several Windows internals concepts:
 
-| Classic Injection IoC | Replacement |
-|---|---|
-| `VirtualAllocEx` | `NtCreateSection` + `NtMapViewOfSection` |
-| `WriteProcessMemory` | Shared memory , local view write propagates to remote |
-| `CreateRemoteThread` | Thread context hijack (`SuspendThread` → `SetThreadContext` → `ResumeThread`) |
-| `GetModuleHandle` | PEB walk via `__readgsqword(0x60)` |
-| `GetProcAddress` | Manual PE export directory parsing with DJB2 hash matching |
+- **AES-256-CBC decryption:** Uses the Windows Cryptography API: Next Generation (CNG) through `BCrypt*` APIs to decrypt the embedded byte array.
+- **Hash-based API resolution:** Uses a DJB2-style hash to locate exported functions in a module's PE export directory.
+- **PEB module enumeration:** Walks the current process' loader list to locate `ntdll.dll` without calling `GetModuleHandle` for it.
+- **Section creation and mapping:** Resolves and calls `NtCreateSection` and `NtMapViewOfSection` to create a section and map views into the local and target processes.
+- **Thread-context redirection:** Suspends a thread in the target process, updates its instruction pointer (`RIP`) to the remote section view, and resumes it.
 
-No new threads are created. No memory is written across process boundaries. No Win32 resolver APIs are called.
+## Execution flow
 
----
+1. Decrypt the embedded byte array with AES-256-CBC using the configured key and IV.
+2. Allocate a local buffer for the plaintext.
+3. Find the target process (`notepad.exe`) and one of its threads.
+4. Locate `ntdll.dll` through the PEB loader data and resolve the required native APIs by export-name hash.
+5. Create a section object and map it into the current process with read/write permissions.
+6. Copy the decrypted bytes into the local section view.
+7. Map the same section into the target process with read/execute permissions.
+8. Suspend the selected target thread, set its `RIP` to the remote mapping, and resume it.
 
-## How It Works
+## Requirements
 
-### 1. PEB Walking , Module Resolution Without `GetModuleHandle`
-
-```
-GS:[0x60]  →  PEB
-               └─ Ldr
-                   └─ InMemoryOrderModuleList  (doubly-linked list of loaded modules)
-                         ├─ ntdll.dll
-                         ├─ kernel32.dll
-                         └─ ...
-```
-
-`GetModuleHandleCustom` reads the PEB pointer directly from the thread environment block via `__readgsqword(0x60)`, walks the `InMemoryOrderModuleList`, extracts each module's filename, lowercases it, hashes it with DJB2, and returns the base address on match.
-
-```c
-PPEB pPebvar = (PEB*)(__readgsqword(0x60));
-PPEB_LDR_DATA pLDR = pPebvar->Ldr;
-// walk InMemoryOrderModuleList...
-```
-
-No call to `GetModuleHandleA/W` or `LoadLibrary`.
-
----
-
-### 2. Export Directory Parsing , Function Resolution Without `GetProcAddress`
-
-`GetProcAddReplacement` parses the PE export directory of the target module manually:
-
-```
-DLL base
- └─ IMAGE_DOS_HEADER  →  e_lfanew
-     └─ IMAGE_NT_HEADERS
-         └─ OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT]
-             └─ IMAGE_EXPORT_DIRECTORY
-                 ├─ AddressOfNames      [i]  →  function name string
-                 ├─ AddressOfNameOrdinals[i] →  ordinal index
-                 └─ AddressOfFunctions  [ordinal] → function RVA
-```
-
-Each exported function name is hashed with DJB2 and compared against the target hash constant. On match, the RVA is resolved to an absolute address.
-
-No call to `GetProcAddress`. No plaintext API name strings in the binary.
-
----
-
-### 3. Section-Based Injection , No `VirtualAllocEx` or `WriteProcessMemory`
-
-```
-NtCreateSection(PAGE_EXECUTE_READWRITE, SEC_COMMIT)
-      │
-      ├─ NtMapViewOfSection(current process, PAGE_READWRITE)   → LocalMapping
-      │       memcpy(LocalMapping, shellcode, len)
-      │       └─ write propagates to the shared section automatically
-      │
-      └─ NtMapViewOfSection(target process, PAGE_EXECUTE_READ) → RemoteMapping
-```
-
-Both views point to the same physical pages. Writing shellcode to the local `PAGE_READWRITE` view makes it readable and executable in the remote `PAGE_EXECUTE_READ` view without a single cross-process write call.
-
----
-
-### 4. Thread Hijacking , No `CreateRemoteThread`
-
-An existing thread in the target process is borrowed rather than a new one created:
-
-```
-CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD)
-    └─ find first thread owned by target PID  →  TID
-
-OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME)
-    │
-    ├─ SuspendThread
-    ├─ GetThreadContext   (save current RIP and register state)
-    ├─ ThreadCTX.Rip = RemoteMapping   (point RIP at shellcode)
-    ├─ SetThreadContext
-    └─ ResumeThread       (thread now executes shellcode on next scheduling)
-```
-
-No new thread telemetry. No `CreateRemoteThread` or `NtCreateThreadEx` call.
-
----
-
-## Full Execution Flow
-
-```
-main()
-  │
-  ├─ FindPID("notepad.exe")         via TH32CS_SNAPPROCESS
-  ├─ findTID(pid)                   via TH32CS_SNAPTHREAD
-  ├─ OpenProcess(VM_OPERATION | SYNCHRONIZE | ...)
-  │
-  ├─ GetModuleHandleCustom(ntdll_hash)   ← PEB walk
-  ├─ GetProcAddReplacement(NtCreateSection_Hash)
-  ├─ GetProcAddReplacement(NtMapViewOfSection_Hash)
-  │
-  ├─ NtCreateSection  →  HSection
-  ├─ NtMapViewOfSection(current, RW)  →  LocalMapping
-  ├─ memcpy(LocalMapping, shellcode)
-  ├─ NtMapViewOfSection(target, RX)   →  RemoteMapping
-  │
-  ├─ OpenThread  →  TargetThreadHandle
-  ├─ SuspendThread
-  ├─ GetThreadContext
-  ├─ Rip = RemoteMapping
-  ├─ SetThreadContext
-  └─ ResumeThread
-```
-
----
-
-## Known Limitations
-
-**RIP not preserved**
-The original thread RIP is overwritten and not restored. When the shellcode executes a `RET`, control returns to whatever is on the thread's stack at the time of hijacking , likely causing the target process to crash after payload execution. A complete implementation would prepend a stub that saves the original RIP and restores it post-shellcode, or use an APC queue for safer execution.
-
-**Section created with PAGE_EXECUTE_READWRITE**
-`NtCreateSection` is called with `PAGE_EXECUTE_READWRITE`. While the individual views use minimal permissions (local RW, remote RX), the section's own protection flags are a detectable IoC. Creating the section as `PAGE_EXECUTE_READ` and mapping it locally with a separate writable view avoids this.
-
-**First-thread assumption**
-`findTID` returns the first thread found for the target PID. In practice, hijacking a thread that is currently inside a critical section or a kernel wait state can deadlock the process. A robust implementation would inspect thread state before selecting.
-
----
+- Windows x64
+- A 64-bit C compiler and compatible Windows SDK (the code uses Windows headers and the x64 `GS`-register intrinsic)
+- The Windows CNG library (`bcrypt.lib`)
+- A target process named `notepad.exe` for the current hard-coded example
+- Sufficient permissions to obtain the requested process and thread handles
 
 ## Build
 
-```bash
-# MSVC
-cl inject.c /Fe:inject.exe
+From an **x64 Native Tools** command prompt for Visual Studio, a typical MSVC build command is:
 
-# MinGW
-gcc inject.c -o inject.exe -lntdll -lpsapi
+```bat
+cl /nologo /W4 /O2 /std:c11 mappedinjenc.c /link bcrypt.lib
 ```
 
-Run with a `notepad.exe` instance already open.
+The exact compiler and SDK versions may require adjustments to declarations for undocumented/native Windows structures and APIs.
 
----
+## Payload configuration
 
-## Detection Notes
+The `shellcode_enc` array in the uploaded source is currently only a placeholder:
 
-Despite eliminating the five IoCs above, several detectable behaviors remain:
+```c
+const BYTE shellcode_enc[] = {
+    // Adaptix beacon shellcode
+};
+```
 
-- `OpenProcess` and `OpenThread` with broad access rights generate kernel telemetry
-- `NtCreateSection` with `SEC_COMMIT` + execute permissions is monitored by modern EDRs
-- Thread context modification (`NtSetContextThread`) is a high-signal behavioral indicator
-- `SuspendThread` on a thread in another process is flagged by many EDRs
+For a meaningful test, the array must contain ciphertext produced with the same AES-256-CBC key, IV, and padding convention expected by `aes_decrypt`. The implementation uses `BCRYPT_BLOCK_PADDING`; AES-CBC ciphertext must therefore satisfy the block-size requirements and use compatible padding.
 
-The purpose of this project is to understand the tradeoffs in injection technique design, not to claim full EDR evasion.
+The key and IV currently present in the source are fixed demonstration values. They are not suitable for protecting real secrets. AES-CBC also does not provide authenticity or integrity checking, so successful decryption alone does not prove that the data has not been modified.
 
----
+## Important limitations
 
-## Related Projects
+This is a research PoC, not production-quality code. In its current form, it has several robustness and correctness gaps:
 
-- [GhostlyIAT](https://github.com/Adroxz1122/GhostlyIAT) , the PEB walk and export directory parsing used here is an extension of techniques developed there
-- [Thread-Hijacking](https://github.com/Adroxz1122/Thread-Hijacking) , standalone thread hijacking implementation
+- `FindPID` can return an uninitialized PID when the requested process is not found.
+- The code assumes that a target process and at least one target thread are available; it selects the first thread returned by the snapshot.
+- Several handles and API results are not fully validated before they are used.
+- Error paths do not consistently release all allocated memory, handles, or section views.
+- The original thread context is not saved and restored. Redirecting `RIP` changes the selected thread's execution path.
+- The implementation depends on native interfaces and loader structures that are not stable, documented application-level APIs.
+- The source does not include the encrypted payload bytes, so successful execution has not been established from the uploaded file alone.
 
----
+## Safety and intended use
 
-## References
+This repository is intended for **Windows internals study, controlled lab experiments, and defensive security research**. Run it only in an isolated test environment against processes and systems you own or are explicitly authorized to assess. Do not use it to execute payloads on third-party systems.
 
-- Windows Internals 7th Ed. , Part 1, Chapter 5 (Memory Management), Section Objects
-- ReactOS source , `NtCreateSection`, `NtMapViewOfSection` signatures  
-- MalDev Academy , Mapping Injection and Thread Hijacking modules
-- `winternl.h`, `TlHelp32.h` , undocumented structure definitions
+## Learning topics
+
+- Windows section objects and mapped views
+- PE headers and export tables
+- PEB and loader data structures
+- Windows CNG and AES-CBC
+- Native API resolution
+- Thread suspension and `CONTEXT` manipulation
+
